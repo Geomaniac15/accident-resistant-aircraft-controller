@@ -23,6 +23,21 @@ CD0 = 0.045            # parasitic drag (gear/flaps add drag at takeoff)
 k_induced = 0.045      # induced-drag factor
 alpha_stall = math.radians(15)
 
+# stall speed: slowest the wing can still hold the weight (at max lift coefficient)
+CL_max = CL0 + CL_alpha * alpha_stall
+stall_speed = math.sqrt(2 * mass * g / (rho * wing_area * CL_max))   # ~63 m/s
+
+# post-stall / departure behaviour (only active once the wing is stalled)
+chord = 4.0            # mean aerodynamic chord (m), sets the moment arm
+CD_max = 1.8           # broadside drag coefficient (fully separated)
+Cm_stable = 0.6        # static stability while the flow is attached
+Cm_damp = 4.0          # aerodynamic pitch damping while attached
+Cm_unstable = 6.0      # divergence once stalled: this is what makes it tumble
+
+def wrap_angle(a):
+    # keep an angle in [-pi, pi] so the airframe can rotate all the way round
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
 # inner pitch loop (sized for the large inertia: wn = 2 rad/s, zeta = 0.9) 
 pitch_wn = 2.0
 pitch_zeta = 0.9
@@ -38,29 +53,42 @@ Ki_spd = 3_000.0
 # climb-rate loop (commanded climb rate -> pitch) 
 Ki_vs = 0.02
 
-def aero_forces(vx, vy, pitch):
-    # lift acts perpendicular to the velocity vector, drag opposes it
+def aero_forces(vx, vy, pitch, pitch_rate):
+    # full-envelope aero: behaves like a wing while attached, and like a
+    # tumbling flat plate once the flow separates past the stall angle.
+    # returns the x/y forces, the aerodynamic pitching moment, and the
+    # separation fraction (0 = attached, 1 = fully stalled).
     V2 = vx * vx + vy * vy
     V = math.sqrt(V2)
     if V < 1e-6:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
-    gamma = math.atan2(vy, vx)        # flight-path angle (direction of travel)
-    alpha = pitch - gamma             # angle of attack
-    alpha = max(-alpha_stall, min(alpha_stall, alpha))   # stall clamp
+    gamma = math.atan2(vy, vx)             # flight-path angle (direction of travel)
+    alpha = wrap_angle(pitch - gamma)      # angle of attack (full range)
 
-    q = 0.5 * rho * V2                # dynamic pressure
-    CL = CL0 + CL_alpha * alpha
-    CD = CD0 + k_induced * CL * CL
+    # separation: 0 below the stall angle, ramping to 1 over the next 8 degrees
+    sep = max(0.0, min(1.0, (abs(alpha) - alpha_stall) / math.radians(8)))
+
+    q = 0.5 * rho * V2                      # dynamic pressure
+    CL_attached = CL0 + CL_alpha * alpha
+    # blend the attached lift curve with a separated flat-plate curve
+    CL = (1 - sep) * CL_attached + sep * 2 * math.sin(alpha) * math.cos(alpha)
+    CD = CD0 + (1 - sep) * k_induced * CL_attached * CL_attached \
+        + sep * CD_max * math.sin(alpha) * math.sin(alpha)
 
     lift = q * wing_area * CL
     drag = q * wing_area * CD
-
     fx = -drag * math.cos(gamma) - lift * math.sin(gamma)
     fy = lift * math.cos(gamma) - drag * math.sin(gamma)
-    return fx, fy
 
-def simulate(K_h, K_vs, record=False):
+    # pitching moment: stable and damped while attached, divergent once stalled
+    Cm = (1 - sep) * (-Cm_stable * alpha) + sep * (Cm_unstable * math.sin(alpha))
+    moment = q * wing_area * chord * Cm
+    moment -= (1 - sep) * Cm_damp * q * wing_area * chord * chord \
+        * pitch_rate / (2 * max(V, 1.0))
+    return fx, fy, moment, sep
+
+def simulate(K_h, K_vs, record=False, engine_fail_time=None):
     # autopilot cascade:
     #   altitude error -> commanded climb rate (limited to vs_max)   gain K_h
     #   climb-rate error -> commanded pitch (PI)                     gain K_vs, Ki_vs
@@ -75,6 +103,7 @@ def simulate(K_h, K_vs, record=False):
 
     spd_integral = 0.0
     vs_integral = 0.0
+    airborne = False
 
     total_error = 0.0
     overshoot = 0.0
@@ -96,6 +125,10 @@ def simulate(K_h, K_vs, record=False):
             spd_integral = spd_integral - spd_error * dt
             thrust = thrust_clamped
 
+        # engine failure: total loss of thrust from this time on
+        if engine_fail_time is not None and t >= engine_fail_time:
+            thrust = 0.0
+
         # outer loop: altitude error -> commanded climb rate (limited)
         alt_error = target_altitude - y
         vs_cmd = max(-vs_max, min(vs_max, K_h * alt_error))
@@ -108,13 +141,18 @@ def simulate(K_h, K_vs, record=False):
             vs_integral = vs_integral + vs_error * dt
         commanded_pitch = cp_clamped
 
-        # inner loop: pitch -> control torque
-        error = commanded_pitch - pitch
-        torque = Kp_pitch * error - Kd_pitch * pitch_rate
-        pitch_rate = pitch_rate + (torque / inertia) * dt
-        pitch = pitch + pitch_rate * dt
+        aero_fx, aero_fy, aero_moment, sep = aero_forces(vx, vy, pitch, pitch_rate)
 
-        aero_fx, aero_fy = aero_forces(vx, vy, pitch)
+        # inner loop: pitch -> control torque. Elevator authority fades as the
+        # airspeed decays (q_ratio) and vanishes when the tail is in separated
+        # flow (1 - sep), so a deep stall leaves the airframe uncontrollable.
+        q_ratio = min(1.0, (V / V_liftoff) ** 2)
+        authority = q_ratio * (1 - sep)
+        error = commanded_pitch - pitch
+        torque = authority * (Kp_pitch * error - Kd_pitch * pitch_rate) + aero_moment
+        pitch_rate = pitch_rate + (torque / inertia) * dt
+        pitch = wrap_angle(pitch + pitch_rate * dt)
+
         fx = thrust * math.cos(pitch) + aero_fx
         fy = thrust * math.sin(pitch) + aero_fy - mass * g
 
@@ -133,8 +171,15 @@ def simulate(K_h, K_vs, record=False):
         prev_commanded = commanded_pitch
 
         if record:
-            history.append((t, x, y, math.degrees(commanded_pitch), math.degrees(pitch)))
+            airspeed = math.hypot(vx, vy)
+            history.append((t, x, y, math.degrees(commanded_pitch), math.degrees(pitch), airspeed))
         t = t + dt
+
+        # stop the run when the aircraft hits the ground (after it has flown)
+        if y > 20:
+            airborne = True
+        if airborne and y <= 0:
+            break
 
     # reward a smooth, comfortable, on-target climb
     score = total_error + 30.0 * overshoot + 40.0 * fast_climb + 20.0 * effort
@@ -161,9 +206,20 @@ if __name__ == '__main__':
                     best_gains = (K_h, K_vs)
 
     print(f'\nBEST: K_h={best_gains[0]}, K_vs={best_gains[1]}, score={best_score:.1f}')
+    print(f'stall speed = {stall_speed:.1f} m/s')
 
+    def write_flight(filename, history):
+        with open(filename, 'w') as f:
+            f.write('t,x,y,commanded_pitch,actual_pitch,airspeed\n')
+            for row in history:
+                f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]}\n")
+
+    # nominal climb
     score, history = simulate(best_gains[0], best_gains[1], record=True)
-    with open('flight.csv', 'w') as f:
-        f.write('t,x,y,commanded_pitch,actual_pitch\n')
-        for row in history:
-            f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]}\n")
+    write_flight('flight.csv', history)
+
+    # same climb, but both engines fail at t = 12 s, shortly after takeoff:
+    # the autopilot keeps pulling for altitude, stalls, departs and tumbles in
+    score, history = simulate(best_gains[0], best_gains[1], record=True, engine_fail_time=12.0)
+    write_flight('flight_failure.csv', history)
+    print('wrote flight.csv (nominal) and flight_failure.csv (engine failure at t=12s)')
