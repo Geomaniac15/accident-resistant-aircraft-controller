@@ -68,10 +68,12 @@ if __name__ == "__main__":
                     best_score = score
                     best_gains = (Kp_alt, Kd_alt)
 
-    score, history = simulate(best_gains[0], best_gains[1], record=True)
+    print(f'\nBEST: Kp_alt={best_gains[0]}, Kd_alt={best_gains[1]}, score={best_score:.1f}')
+
+    score, history = simulate(0.01, 0.0, record=True)
     with open('flight.csv', 'w') as f:
         f.write('t,x,y,commanded_pitch,actual_pitch\n')
         for row in history:
             f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]}\n")
 
-    print(f'\nBEST: Kp_alt={best_gains[0]}, Kd_alt={best_gains[1]}, score={best_score:.1f}')
+    
