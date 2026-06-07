@@ -1,122 +1,103 @@
 import sys
+import math
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-import math
-from simulator import alpha_stall
 
-# which flight to play: default nominal, pass a file for others
+# which flight to play (default nominal):
 #   python visualiser.py flight.csv
+#   python visualiser.py allout_cruise.csv
 filename = sys.argv[1] if len(sys.argv) > 1 else 'flight.csv'
 
-# read the flight (stall speed varies with altitude/config, so it is per-step)
 with open(filename, 'r') as f:
-    lines = f.readlines()[1:]
-    times, xs, ys, commanded_pitches, actual_pitches, airspeeds, stall_speeds = \
-        [], [], [], [], [], [], []
-    for line in lines:
-        t, x, y, cp, ap, v, vs = line.strip().split(',')
-        times.append(float(t))
-        xs.append(float(x))
-        ys.append(float(y))
-        commanded_pitches.append(float(cp))
-        actual_pitches.append(float(ap))
-        airspeeds.append(float(v))
-        stall_speeds.append(float(vs))
+    rows = [line.strip().split(',') for line in f.readlines()[1:] if line.strip()]
+cols = list(zip(*[[float(v) for v in r] for r in rows]))
+times, xs, alts, lats, rolls, pitches, yaws, alphas, betas, speeds, stalls = cols
 
-# angle of attack = body pitch - flight-path angle.
-aoas = []
-for i in range(len(times)):
-    j = min(i + 1, len(times) - 1)
-    k = max(i - 1, 0)
-    vx = (xs[j] - xs[k]) / (times[j] - times[k] + 1e-9)
-    vy = (ys[j] - ys[k]) / (times[j] - times[k] + 1e-9)
-    gamma = math.degrees(math.atan2(vy, vx))   # flight-path angle
-    aoas.append(actual_pitches[i] - gamma)
+# aircraft silhouettes
+# rear view (looking forward): wings, fuselage, fin
+rear_shape = [(-1.0, 0.0), (1.0, 0.0)]          # wing line
+rear_fin = [(0.0, 0.0), (0.0, 0.45)]            # vertical tail
+# top view (looking down): nose forward (+x), swept wings, tail
+top_shape = [(1.2, 0.0), (-0.2, 0.9), (-0.1, 0.15), (-0.9, 0.5),
+             (-1.0, 0.0), (-0.9, -0.5), (-0.1, -0.15), (-0.2, -0.9)]
 
-stall_deg = math.degrees(alpha_stall)
+def rotate(points, ang):
+    c, s = math.cos(ang), math.sin(ang)
+    return [(px * c - py * s, px * s + py * c) for px, py in points]
 
-# the plane's shape
-plane_shape = [
-    (1.0, 0.0),    # nose
-    (-0.6, 0.4),   # top tail
-    (-0.3, 0.0),   # tail notch
-    (-0.6, -0.4),  # bottom tail
-]
-
-def rotate(points, angle_rad):
-    out = []
-    for px, py in points:
-        rx = px * math.cos(angle_rad) - py * math.sin(angle_rad)
-        ry = px * math.sin(angle_rad) + py * math.cos(angle_rad)
-        out.append((rx, ry))
-    return out
-
-# layout: big angle-of-attack view on the left, altitude and airspeed stacked right
-fig, axd = plt.subplot_mosaic([['aoa', 'alt'], ['aoa', 'spd']],
-                              figsize=(12, 5), layout='constrained',
-                              gridspec_kw={'width_ratios': [2, 1]})
+fig, axd = plt.subplot_mosaic([['bank', 'track'], ['alt', 'spd']],
+                              figsize=(12, 7), layout='constrained')
 fig.suptitle(filename)
-ax_plane, ax_alt, ax_spd = axd['aoa'], axd['alt'], axd['spd']
+ax_bank, ax_track, ax_alt, ax_spd = axd['bank'], axd['track'], axd['alt'], axd['spd']
 
-# angle-of-attack panel: view aligned to the airflow, plane tilts by the AoA
-ax_plane.set_xlim(-2, 2)
-ax_plane.set_ylim(-2, 2)
-ax_plane.set_aspect('equal')
-ax_plane.set_title('angle of attack')
-ax_plane.axhline(0, color='lightgray', linewidth=0.8)            # relative wind line
-ax_plane.annotate('', xy=(0.55, 0.0), xytext=(1.9, 0.0),
-                  arrowprops=dict(arrowstyle='->', color='lightgray'))
-ax_plane.text(1.9, -0.18, 'relative wind', color='gray', ha='right', va='top', fontsize=9)
-plane_patch, = ax_plane.fill([], [], color='tab:blue')
-aoa_text = ax_plane.text(-1.9, 1.7, '', fontsize=11, va='top')
+# bank (rear view) panel
+ax_bank.set_xlim(-1.6, 1.6)
+ax_bank.set_ylim(-1.6, 1.6)
+ax_bank.set_aspect('equal')
+ax_bank.set_title('bank  (view from behind)')
+ax_bank.axhline(0, color='lightgray', linewidth=0.8)   # horizon
+wing_line, = ax_bank.plot([], [], color='tab:blue', linewidth=4)
+fin_line, = ax_bank.plot([], [], color='tab:blue', linewidth=2)
+bank_text = ax_bank.text(-1.5, 1.4, '', fontsize=10, va='top')
+
+# ground-track (top-down) panel: downrange vs lateral
+ax_track.plot(xs, lats, color='lightgray')
+ax_track.plot([xs[0]], [lats[0]], '^', color='gray', markersize=7)   # start
+ax_track.set_aspect('equal')
+ax_track.set_title('ground track  (top-down)')
+ax_track.set_xlabel('downrange (m)')
+ax_track.set_ylabel('lateral (m)')
+track_marker, = ax_track.plot([], [], color='none')
+plane_top, = ax_track.fill([], [], color='tab:blue')
+span_track = max(max(xs) - min(xs), max(lats) - min(lats), 1.0)
+plane_scale = 0.04 * span_track
 
 # altitude panel
-ax_alt.plot(times, ys, color='lightgray')
-ax_alt.axhline(0, color='saddlebrown', linewidth=0.8)   # the ground
+ax_alt.plot(times, alts, color='lightgray')
+ax_alt.axhline(0, color='saddlebrown', linewidth=0.8)
 ax_alt.set_xlim(min(times), max(times))
-ax_alt.set_ylim(min(min(ys) - 10, -10), max(ys) + 10)
+ax_alt.set_ylim(min(min(alts) - 10, -10), max(alts) + 10)
 ax_alt.set_title('altitude (m)')
+ax_alt.set_xlabel('time (s)')
 alt_dot, = ax_alt.plot([], [], 'o', color='tab:red')
 
-# airspeed panel, with the (altitude-dependent) stall-speed reference
-ax_spd.plot(times, airspeeds, color='lightgray')
-ax_spd.plot(times, stall_speeds, color='tab:red', linestyle='--', linewidth=1.0)
-ax_spd.text(times[-1], stall_speeds[-1], ' stall', color='tab:red',
-            va='bottom', ha='right', fontsize=8)
+# airspeed panel with the (altitude-dependent) stall reference
+ax_spd.plot(times, speeds, color='lightgray')
+ax_spd.plot(times, stalls, color='tab:red', linestyle='--', linewidth=1.0)
+ax_spd.text(times[-1], stalls[-1], ' stall', color='tab:red', va='bottom', ha='right', fontsize=8)
 ax_spd.set_xlim(min(times), max(times))
-ax_spd.set_ylim(min(min(airspeeds), min(stall_speeds)) - 8, max(airspeeds) + 8)
+ax_spd.set_ylim(min(min(speeds), min(stalls)) - 8, max(speeds) + 8)
 ax_spd.set_title('airspeed (m/s)')
 ax_spd.set_xlabel('time (s)')
 spd_dot, = ax_spd.plot([], [], 'o', color='tab:red')
 
-step = 20
+step = max(1, len(times) // 600)
 frames = range(0, len(times), step)
 
 def draw_frame(i):
-    aoa = aoas[i]
-    plane_patch.set_xy(rotate(plane_shape, math.radians(aoa)))
+    roll = math.radians(rolls[i])
+    # rear view: bank the aircraft; colour by AoA stall / inverted
+    wing = rotate(rear_shape, roll)
+    fin = rotate(rear_fin, roll)
+    wing_line.set_data([p[0] for p in wing], [p[1] for p in wing])
+    fin_line.set_data([p[0] for p in fin], [p[1] for p in fin])
+    stalled = abs(alphas[i]) >= 15
+    colour = 'tab:red' if stalled else ('tab:orange' if abs(rolls[i]) > 60 else 'tab:blue')
+    wing_line.set_color(colour)
+    fin_line.set_color(colour)
+    bank_text.set_text(f'roll  {rolls[i]:6.0f}\npitch {pitches[i]:6.0f}\nyaw   {yaws[i]:6.0f}\nAoA   {alphas[i]:5.1f}\nsideslip {betas[i]:5.1f}')
+    bank_text.set_color('tab:red' if stalled else 'black')
 
-    # warn as the wing approaches the stall angle (either direction, for tumbles)
-    if abs(aoa) >= stall_deg:
-        plane_patch.set_color('tab:red')
-        aoa_text.set_text(f'AoA = {aoa:6.1f} deg   STALL')
-        aoa_text.set_color('tab:red')
-    elif abs(aoa) >= 0.8 * stall_deg:
-        plane_patch.set_color('tab:orange')
-        aoa_text.set_text(f'AoA = {aoa:6.1f} deg')
-        aoa_text.set_color('tab:orange')
-    else:
-        plane_patch.set_color('tab:blue')
-        aoa_text.set_text(f'AoA = {aoa:6.1f} deg')
-        aoa_text.set_color('black')
+    # top-down: plane glyph at current position pointing along heading
+    heading = math.radians(yaws[i])
+    pts = rotate([(px * plane_scale, py * plane_scale) for px, py in top_shape], heading)
+    plane_top.set_xy([(xs[i] + px, lats[i] + py) for px, py in pts])
+    plane_top.set_color(colour)
 
-    alt_dot.set_data([times[i]], [ys[i]])
-
-    # airspeed dot turns red below stall speed
-    spd_dot.set_data([times[i]], [airspeeds[i]])
-    spd_dot.set_color('tab:red' if airspeeds[i] < stall_speeds[i] else 'tab:green')
-
-    return plane_patch, alt_dot, spd_dot, aoa_text
+    alt_dot.set_data([times[i]], [alts[i]])
+    spd_dot.set_data([times[i]], [speeds[i]])
+    spd_dot.set_color('tab:red' if speeds[i] < stalls[i] else 'tab:green')
+    return wing_line, fin_line, plane_top, alt_dot, spd_dot, bank_text
 
 anim = FuncAnimation(fig, draw_frame, frames=frames, interval=30, blit=False)
 plt.show()
