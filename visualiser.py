@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import math
-from simulator import simulate
+from simulator import alpha_stall
 
 # read the flight
 with open('flight.csv', 'r') as f:
@@ -15,8 +15,19 @@ with open('flight.csv', 'r') as f:
         commanded_pitches.append(float(cp))
         actual_pitches.append(float(ap))
 
-# the plane's shape, drawn pointing right (nose at +x), centred on (0,0)
-# a simple triangle: nose, and two tail corners
+# angle of attack = body pitch - flight-path angle.
+aoas = []
+for i in range(len(times)):
+    j = min(i + 1, len(times) - 1)
+    k = max(i - 1, 0)
+    vx = (xs[j] - xs[k]) / (times[j] - times[k] + 1e-9)
+    vy = (ys[j] - ys[k]) / (times[j] - times[k] + 1e-9)
+    gamma = math.degrees(math.atan2(vy, vx))   # flight-path angle
+    aoas.append(actual_pitches[i] - gamma)
+
+stall_deg = math.degrees(alpha_stall)
+
+# the plane's shape
 plane_shape = [
     (1.0, 0.0),    # nose
     (-0.6, 0.4),   # top tail
@@ -33,18 +44,23 @@ def rotate(points, angle_rad):
         out.append((rx, ry))
     return out
 
-# two panels: big attitude view, small altitude strip
+# two panels: big angle-of-attack view, small altitude strip
 fig, (ax_plane, ax_alt) = plt.subplots(1, 2, figsize=(11, 5),
                                        gridspec_kw={'width_ratios': [2, 1]})
 
-# attitude panel: fixed square, plane sits centred and only rotates
+# angle-of-attack panel:
 ax_plane.set_xlim(-2, 2)
 ax_plane.set_ylim(-2, 2)
-ax_plane.set_aspect('equal')   # now rotation looks true, no squashing
-ax_plane.set_title('attitude')
-ax_plane.axhline(0, color='lightgray', linewidth=0.8)  # horizon reference
+ax_plane.set_aspect('equal')
+ax_plane.set_title('angle of attack')
+ax_plane.axhline(0, color='lightgray', linewidth=0.8)            # relative wind line
+ax_plane.annotate('', xy=(0.55, 0.0), xytext=(1.9, 0.0),         # airflow arrow
+                  arrowprops=dict(arrowstyle='->', color='lightgray'))
+ax_plane.text(1.9, -0.18, 'relative wind', color='gray',
+              ha='right', va='top', fontsize=9)
 
-plane_patch, = ax_plane.fill([], [], color='tab:red')
+plane_patch, = ax_plane.fill([], [], color='tab:blue')
+aoa_text = ax_plane.text(-1.9, 1.7, '', fontsize=11, va='top')
 
 # altitude panel: the trace over time, with a moving dot
 ax_alt.plot(times, ys, color='lightgray')
@@ -58,14 +74,28 @@ step = 20
 frames = range(0, len(times), step)
 
 def draw_frame(i):
-    # rotate the plane shape to the actual pitch and draw it centred
-    angle = math.radians(actual_pitches[i])
-    pts = rotate(plane_shape, angle)
+    aoa = aoas[i]
+    # rotate the plane by its angle of attack, relative to the airflow
+    pts = rotate(plane_shape, math.radians(aoa))
     plane_patch.set_xy(pts)
+
+    # warn as the wing approaches the stall angle
+    if aoa >= stall_deg:
+        plane_patch.set_color('tab:red')
+        aoa_text.set_text(f'AoA = {aoa:5.1f} deg   STALL')
+        aoa_text.set_color('tab:red')
+    elif aoa >= 0.8 * stall_deg:
+        plane_patch.set_color('tab:orange')
+        aoa_text.set_text(f'AoA = {aoa:5.1f} deg')
+        aoa_text.set_color('tab:orange')
+    else:
+        plane_patch.set_color('tab:blue')
+        aoa_text.set_text(f'AoA = {aoa:5.1f} deg')
+        aoa_text.set_color('black')
 
     # move the dot along the altitude trace
     alt_dot.set_data([times[i]], [ys[i]])
-    return plane_patch, alt_dot
+    return plane_patch, alt_dot, aoa_text
 
 anim = FuncAnimation(fig, draw_frame, frames=frames, interval=30, blit=False)
 plt.show()
