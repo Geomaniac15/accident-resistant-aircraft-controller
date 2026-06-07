@@ -2,24 +2,26 @@ import sys
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import math
-from simulator import alpha_stall, stall_speed
+from simulator import alpha_stall
 
 # which flight to play: default nominal, pass a file for others
-#   python visualiser.py flight_failure.csv
+#   python visualiser.py flight.csv
 filename = sys.argv[1] if len(sys.argv) > 1 else 'flight.csv'
 
-# read the flight
+# read the flight (stall speed varies with altitude/config, so it is per-step)
 with open(filename, 'r') as f:
     lines = f.readlines()[1:]
-    times, xs, ys, commanded_pitches, actual_pitches, airspeeds = [], [], [], [], [], []
+    times, xs, ys, commanded_pitches, actual_pitches, airspeeds, stall_speeds = \
+        [], [], [], [], [], [], []
     for line in lines:
-        t, x, y, cp, ap, v = line.strip().split(',')
+        t, x, y, cp, ap, v, vs = line.strip().split(',')
         times.append(float(t))
         xs.append(float(x))
         ys.append(float(y))
         commanded_pitches.append(float(cp))
         actual_pitches.append(float(ap))
         airspeeds.append(float(v))
+        stall_speeds.append(float(vs))
 
 # angle of attack = body pitch - flight-path angle.
 aoas = []
@@ -76,13 +78,13 @@ ax_alt.set_ylim(min(min(ys) - 10, -10), max(ys) + 10)
 ax_alt.set_title('altitude (m)')
 alt_dot, = ax_alt.plot([], [], 'o', color='tab:red')
 
-# airspeed panel, with the stall-speed reference line
+# airspeed panel, with the (altitude-dependent) stall-speed reference
 ax_spd.plot(times, airspeeds, color='lightgray')
-ax_spd.axhline(stall_speed, color='tab:red', linestyle='--', linewidth=1.0)
-ax_spd.text(times[-1], stall_speed, f' stall {stall_speed:.0f}', color='tab:red',
+ax_spd.plot(times, stall_speeds, color='tab:red', linestyle='--', linewidth=1.0)
+ax_spd.text(times[-1], stall_speeds[-1], ' stall', color='tab:red',
             va='bottom', ha='right', fontsize=8)
 ax_spd.set_xlim(min(times), max(times))
-ax_spd.set_ylim(min(min(airspeeds), stall_speed) - 8, max(airspeeds) + 8)
+ax_spd.set_ylim(min(min(airspeeds), min(stall_speeds)) - 8, max(airspeeds) + 8)
 ax_spd.set_title('airspeed (m/s)')
 ax_spd.set_xlabel('time (s)')
 spd_dot, = ax_spd.plot([], [], 'o', color='tab:red')
@@ -112,7 +114,7 @@ def draw_frame(i):
 
     # airspeed dot turns red below stall speed
     spd_dot.set_data([times[i]], [airspeeds[i]])
-    spd_dot.set_color('tab:red' if airspeeds[i] < stall_speed else 'tab:green')
+    spd_dot.set_color('tab:red' if airspeeds[i] < stall_speeds[i] else 'tab:green')
 
     return plane_patch, alt_dot, spd_dot, aoa_text
 
