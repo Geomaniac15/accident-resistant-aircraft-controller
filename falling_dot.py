@@ -19,6 +19,7 @@ previous_error = target - height  # initial error, in meters
 times = []
 heights = []
 targets = []
+throttles = []
 
 t = 0.0  # initial time, in seconds
 while t < 60.0: 
@@ -40,13 +41,22 @@ while t < 60.0:
     times.append(t)
     heights.append(height)
     targets.append(target)
+    throttles.append(throttle)
 
     t = t + dt
     # print(f't={t:.2f}s, height={height:.2f}m, velocity={velocity:.2f} m/s')
 
-plt.plot(times, heights, label='Height')
-plt.plot(times, targets, label='Target', linestyle='--')
-plt.xlabel('Time (s)')
-plt.ylabel('Height (m)')
-plt.legend()
+fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True)
+
+ax1.plot(times, heights, label='Height')
+ax1.plot(times, targets, label='Target', linestyle='--')
+ax1.set_ylabel('Altitude (m)')
+ax1.legend()
+
+ax2.plot(times, throttles, label='Throttle', color='tab:green')
+ax2.axhline(hover, color='gray', linestyle=':', label='Hover')
+ax2.set_xlabel('Time (s)')
+ax2.set_ylabel('Throttle (N)')
+ax2.legend()
+
 plt.show()
