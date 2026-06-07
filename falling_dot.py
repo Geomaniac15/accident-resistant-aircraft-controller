@@ -1,64 +1,46 @@
 import matplotlib.pyplot as plt
+import math
 
-dt = 0.01   # time per tick, in seconds
-g = 9.81    # acceleration due to gravity, in m/s^2
-mass = 1.0    # mass of the dot, in kg
+dt = 0.01
+inertia = 5.0   # moment of inertia: resistance to being spun (rotational 'mass')
 
-height = 0.0  # initial height, in meters
-velocity = 0.0 # initial velocity, in m/s
+pitch = 0.0         # angle in radians, 0 = level
+pitch_rate = 0.0    # angular velocity: how fast it's pitching
 
-target = 100.0  # target height, in meters
-hover = mass * g  # thrust required to hover, in Newtons
-
-Kp = 1.5  # proportional gain for the controller
-Kd = 3.0  # derivative gain for the controller
-
-previous_error = target - height  # initial error, in meters
-previous_height = height 
-
-# storage: one list per thing we want to plot
 times = []
-heights = []
-targets = []
-throttles = []
+pitches = []
+torques = []
 
-t = 0.0  # initial time, in seconds
-while t < 60.0: 
-    # move target partway through
-    if t > 30.0:
-        target = 50.0
-    
-    error = target - height
-    height_rate = (height - previous_height) / dt
-    previous_height = height
-    throttle = hover + Kp * error - Kd * height_rate
-    throttle = max(0.0, throttle)  # throttle can't be negative
+t = 0.0
+while t < 10:
+    # command a torque for the first 2 seconds, then let go
+    if t < 2.0:
+        torque = 1.0
+    elif t < 4.0:
+        torque = -1.0
+    else:
+        torque = 0.0
 
-    net_force = throttle - mass * g
-    acceleration = net_force / mass
-    velocity = velocity + acceleration * dt
-    height = height + velocity * dt
+    # torque to angular velocity to angle
+    angular_acceleration = torque / inertia
+    pitch_rate = pitch_rate + angular_acceleration * dt
+    pitch = pitch + pitch_rate * dt
 
-    # store data for plotting
     times.append(t)
-    heights.append(height)
-    targets.append(target)
-    throttles.append(throttle)
+    pitches.append(math.degrees(pitch))   # store as degrees, easier to read
+    torques.append(torque)
 
     t = t + dt
-    # print(f't={t:.2f}s, height={height:.2f}m, velocity={velocity:.2f} m/s')
 
 fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True)
 
-ax1.plot(times, heights, label='Height')
-ax1.plot(times, targets, label='Target', linestyle='--')
-ax1.set_ylabel('Altitude (m)')
+ax1.plot(times, pitches, label='pitch angle')
+ax1.set_ylabel('pitch (degrees)')
 ax1.legend()
 
-ax2.plot(times, throttles, label='Throttle', color='tab:green')
-ax2.axhline(hover, color='gray', linestyle=':', label='Hover')
-ax2.set_xlabel('Time (s)')
-ax2.set_ylabel('Throttle (N)')
+ax2.plot(times, torques, label='torque', color='tab:green')
+ax2.set_ylabel('torque (N·m)')
+ax2.set_xlabel('time (s)')
 ax2.legend()
 
 plt.show()
