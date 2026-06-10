@@ -102,10 +102,10 @@ def air_density(h):
     h = max(0.0, h)
     return rho0 * (1 - 2.25577e-5 * h) ** 4.25588
 
-def stall_speed(h, config):
+def stall_speed(h, config, m=mass):
     cfg = CONFIGS[config]
     CL_max = cfg['CL0'] + CL_alpha * alpha_stall
-    return math.sqrt(2 * mass * g / (air_density(h) * wing_area * CL_max))
+    return math.sqrt(2 * m * g / (air_density(h) * wing_area * CL_max))
 
 # control gains
 Kp_spd = 80_000.0       # autothrottle (N per m/s)
@@ -165,9 +165,12 @@ def q_from_euler(roll, pitch, yaw):
                      cr*sp*cy + sr*cp*sy, cr*cp*sy - sr*sp*cy])
 
 def simulate(K_h, K_vs, phase='takeoff', fail_engines=(), fail_time=None,
-             accident=None, accident_side='left', record=False):
+             accident=None, accident_side='left', mass_kg=None, wind=(0.0, 0.0, 0.0),
+             record=False, metrics=False):
     P = PHASES[phase]
     config = P['config']
+    m = mass_kg if mass_kg else mass          # swept weight (defaults to nominal)
+    steady_wind = np.array(wind, dtype=float)  # constant NED wind (m/s)
     cfg = CONFIGS[config]
     CL0, CD0 = cfg['CL0'], cfg['CD0']
     V_target = P['V_target']
@@ -189,17 +192,25 @@ def simulate(K_h, K_vs, phase='takeoff', fail_engines=(), fail_time=None,
     jam_elev = None
     exploded = False
     history = []
+    # outcome metrics (for the failure sweep)
+    peak_alt = -1e9
+    min_alt = 1e9
+    min_speed = 1e9
+    min_margin = 1e9
+    max_bank = 0.0
+    max_aoa = 0.0
+    crashed = False
 
     t = 0.0
     while t < P['dur']:
         h = -posn[2]
         rho = air_density(h)
         u, v, w = Vb                       # inertial (ground) velocity, body frame
-        # air-relative velocity (subtract any wind) drives the aerodynamics
+        # air-relative velocity (subtract wind) drives the aerodynamics
+        wind_ned = steady_wind
         if accident == 'windshear' and fail_time is not None and t >= fail_time:
-            wb = rot_n2b(q, microburst_wind(t - fail_time))
-        else:
-            wb = _ZERO3
+            wind_ned = steady_wind + microburst_wind(t - fail_time)
+        wb = rot_n2b(q, wind_ned) if (wind_ned != 0).any() else _ZERO3
         ua, va, wa = u - wb[0], v - wb[1], w - wb[2]
         V = max(math.sqrt(ua*ua + va*va + wa*wa), 1e-3)   # airspeed
         alpha = math.atan2(wa, ua)
@@ -292,7 +303,7 @@ def simulate(K_h, K_vs, phase='takeoff', fail_engines=(), fail_time=None,
         Fy = -drag * sb + side * cb
         Fz = -drag * sa * cb - side * sa * sb - lift * ca
         # gravity in body frame
-        gb = rot_n2b(q, np.array([0.0, 0.0, mass * g]))
+        gb = rot_n2b(q, np.array([0.0, 0.0, m * g]))
         Fx += gb[0]; Fy += gb[1]; Fz += gb[2]
 
         # moments
@@ -304,9 +315,9 @@ def simulate(K_h, K_vs, phase='takeoff', fail_engines=(), fail_time=None,
         pdot = (Lm + (Iyy - Izz) * qrate * r) / Ixx
         qdot = (Mm + (Izz - Ixx) * p * r) / Iyy
         rdot = (Nm + (Ixx - Iyy) * p * qrate) / Izz
-        udot = Fx / mass - (qrate * w - r * v)
-        vdot = Fy / mass - (r * u - p * w)
-        wdot = Fz / mass - (p * v - qrate * u)
+        udot = Fx / m - (qrate * w - r * v)
+        vdot = Fy / m - (r * u - p * w)
+        wdot = Fz / m - (p * v - qrate * u)
 
         Vb = Vb + np.array([udot, vdot, wdot]) * dt
         omega = omega + np.array([pdot, qdot, rdot]) * dt
@@ -323,18 +334,32 @@ def simulate(K_h, K_vs, phase='takeoff', fail_engines=(), fail_time=None,
         effort += abs(pitch_cmd - prev_cmd)
         prev_cmd = pitch_cmd
 
+        peak_alt = max(peak_alt, h)
+        max_bank = max(max_bank, abs(math.degrees(roll)))
+        max_aoa = max(max_aoa, abs(math.degrees(alpha)))
+        min_speed = min(min_speed, V)
+        min_margin = min(min_margin, V - stall_speed(h, config, m))
+        if airborne:
+            min_alt = min(min_alt, h)
+
         t += dt
         if record:
             history.append((t, posn[0], -posn[2], posn[1],
                             math.degrees(roll), math.degrees(pitch), math.degrees(yaw),
                             math.degrees(alpha), math.degrees(beta), V,
-                            stall_speed(h, config)))
+                            stall_speed(h, config, m)))
         if h > P['y0'] + 20 or P['y0'] > 50:
             airborne = True
         if airborne and h <= 0:
+            crashed = True
             break
 
     score = total_error + 30.0 * overshoot + 40.0 * fast_climb + 20.0 * effort
+    if metrics:
+        return dict(crashed=crashed, t_end=round(t, 1), duration=P['dur'],
+                    peak_alt=round(peak_alt), min_alt=round(min(min_alt, peak_alt)),
+                    min_speed=round(min_speed), min_margin=round(min_margin),
+                    max_bank=round(max_bank), max_aoa=round(max_aoa, 1))
     if record:
         return score, history
     return score
