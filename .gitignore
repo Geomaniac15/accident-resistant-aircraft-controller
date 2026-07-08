@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+*.csv
+results/
+*.png
+*.mp4

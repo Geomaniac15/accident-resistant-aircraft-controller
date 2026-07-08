@@ -87,7 +87,7 @@ def run_one(sc):
         'weight': sc['weight'],
         'wind': sc['wind_label'],
         'K_h': sc['K_h'], 'K_vs': sc['K_vs'],
-        'outcome': 'CRASH' if m['crashed'] else 'survived',
+        'outcome': 'CRASH' if m['crashed'] else ('landed' if m['landed'] else 'survived'),
         't_end': m['t_end'], 'peak_alt': m['peak_alt'], 'min_alt': m['min_alt'],
         'min_speed': m['min_speed'], 'min_margin': m['min_margin'],
         'max_bank': m['max_bank'], 'max_aoa': m['max_aoa'],
@@ -118,10 +118,66 @@ def summarize(pattern):
         cells = []
         for p in phases:
             sub = [r for r in rows if r['failure'] == fl and r['phase'] == p]
-            cell = '.' if not sub else f'{sum(r["outcome"] == "survived" for r in sub)}/{len(sub)}'
+            cell = '.' if not sub else f'{sum(r["outcome"] != "CRASH" for r in sub)}/{len(sub)}'
             cells.append(f'{cell:>10}')
         print(f'{fl:<{width}}' + ''.join(cells))
-    print('\n(cells = survived / total across timings and sides)')
+    print('\n(cells = survived-or-landed / total across timings and sides)')
+
+
+def heatmap(pattern, out='results/heatmap.png'):
+    # survival-rate heatmap: one panel per phase, failure type x failure time.
+    import numpy as np
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+
+    rows = []
+    for path in sorted(glob.glob(pattern)):
+        with open(path) as f:
+            rows.extend(csv.DictReader(f))
+    if not rows:
+        print('no result files matched', pattern)
+        return
+    rows = [r for r in rows if r['failure'] != 'nominal']   # baseline has no fail_time axis
+    phases = [p for p in ('takeoff', 'climb', 'cruise', 'approach')
+              if any(r['phase'] == p for r in rows)]
+    failures = sorted({r['failure'] for r in rows})
+
+    # sequential blue ramp (light = low survival receding to the surface, dark = high)
+    ramp = ['#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#184f95', '#0d366b']
+    cmap = LinearSegmentedColormap.from_list('survival', ramp)
+
+    fig, axes = plt.subplots(1, len(phases), figsize=(3.4 * len(phases) + 2, 0.42 * len(failures) + 2),
+                             layout='constrained', squeeze=False)
+    fig.suptitle('survival rate by failure type and failure time', fontsize=12)
+    for ax, phase in zip(axes[0], phases):
+        sub = [r for r in rows if r['phase'] == phase]
+        ftimes = sorted({float(r['fail_time']) for r in sub})
+        grid = np.full((len(failures), len(ftimes)), np.nan)
+        counts = {}
+        for r in sub:
+            i = failures.index(r['failure'])
+            j = ftimes.index(float(r['fail_time']))
+            n_ok, n = counts.get((i, j), (0, 0))
+            counts[(i, j)] = (n_ok + (r['outcome'] != 'CRASH'), n + 1)
+        for (i, j), (n_ok, n) in counts.items():
+            grid[i, j] = n_ok / n
+        im = ax.imshow(grid, cmap=cmap, vmin=0.0, vmax=1.0, aspect='auto')
+        for (i, j), (n_ok, n) in counts.items():
+            ink = '#ffffff' if grid[i, j] > 0.55 else '#0b0b0b'
+            ax.text(j, i, f'{n_ok}/{n}', ha='center', va='center', fontsize=7, color=ink)
+        ax.set_title(phase, fontsize=10)
+        ax.set_xticks(range(len(ftimes)), [f'{ft:g}' for ft in ftimes], fontsize=8)
+        ax.set_xlabel('failure time (s)', fontsize=8)
+        if ax is axes[0][0]:
+            ax.set_yticks(range(len(failures)), failures, fontsize=8)
+        else:
+            ax.set_yticks(range(len(failures)), [''] * len(failures))
+    fig.colorbar(im, ax=axes[0][-1], shrink=0.8, label='survival rate')
+    os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
+    fig.savefig(out, dpi=150)
+    print(f'wrote {out}  ({len(rows)} scenario rows)')
 
 
 def main():
@@ -130,10 +186,15 @@ def main():
     ap.add_argument('--workers', type=int, default=os.cpu_count(), help='parallel processes')
     ap.add_argument('--out', default='results/sweep.csv', help='output CSV for this shard')
     ap.add_argument('--summarize', metavar='GLOB', help='aggregate result CSVs into a matrix and exit')
+    ap.add_argument('--heatmap', metavar='GLOB', help='render result CSVs as a survival heatmap and exit')
+    ap.add_argument('--heatmap-out', default='results/heatmap.png', help='heatmap output image')
     args = ap.parse_args()
 
     if args.summarize:
         summarize(args.summarize)
+        return
+    if args.heatmap:
+        heatmap(args.heatmap, args.heatmap_out)
         return
 
     scenarios = build_scenarios()

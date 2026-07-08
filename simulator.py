@@ -9,6 +9,11 @@ import numpy as np
 # moment toward the dead engine, the dihedral roll-off that follows the sideslip,
 # and (if the controls cannot hold it) a spiral / spin departure.
 #
+# Engines spool with a first-order lag (no instant thrust), dead engines run
+# down to windmilling drag at their station, control surfaces slew at actuator
+# rate limits, inertia scales with the swept weight, and optional Dryden-style
+# turbulence can be layered on the steady wind.
+#
 # 747-8 data: MTOW 442 t, wing area 560 m2, four GEnx-2B67 at 296 kN each.
 # Attitude is integrated as a quaternion so the model survives large upsets
 # (inverted, spinning) without gimbal lock.
@@ -28,8 +33,11 @@ chord = 8.3             # m, mean aerodynamic chord
 # propulsion: four GEnx-2B67, numbered 1-4 left to right
 n_engines = 4
 thrust_per_engine = 296_000.0           # N (~66,500 lbf) each
-engine_y = [-21.3, -11.6, 11.6, 21.3]   # lateral position from centreline (m)
+engine_y = np.array([-21.3, -11.6, 11.6, 21.3])   # lateral position from centreline (m)
 idle_fraction = 0.05
+tau_spool_up = 4.0      # s, first-order spool-up time constant (high-bypass turbofan)
+tau_spool_dn = 1.5      # s, spool-down / flame-out decay
+windmill_drag = 12_000.0  # N, drag of a dead (windmilling) engine at its station
 
 # longitudinal aerodynamics
 CL_alpha = 5.0
@@ -55,10 +63,20 @@ Cn_r = -0.32            # yaw damping
 Cn_da = -0.004          # adverse yaw
 Cn_dr = -0.12           # rudder power
 
-# control surface travel limits (rad)
+# control surface travel limits (rad) and actuator slew-rate limits (rad/s)
 elev_max = math.radians(25)
 ail_max = math.radians(20)
 rud_max = math.radians(25)
+elev_rate = math.radians(60)
+ail_rate = math.radians(60)
+rud_rate = math.radians(50)
+
+def slew(pos, cmd, rate):
+    return pos + max(-rate * dt, min(rate * dt, cmd - pos))
+
+# simplified Dryden turbulence: per-axis Gauss-Markov gusts, length scales in m
+TURB_L = np.array([300.0, 300.0, 100.0])   # (north, east, down)
+TURB_W_FRAC = 0.7                          # vertical gusts weaker than horizontal
 
 # accident parameters (each only acts after fail_time)
 ACCIDENTS = ['rudder-hardover', 'elevator-jam', 'aileron-hardover',
@@ -76,6 +94,13 @@ WING_LOSS_YAW = 0.05        # yaw toward the damaged side (extra drag)
 EXPLOSION_SPIN = (1.2, 0.8, 1.5)  # impulsive (p, q, r) rates imparted (rad/s)
 EXPLOSION_LIFT = 0.5        # lift left after structural break-up
 EXPLOSION_CTRL = 0.2        # control effectiveness left after the blast
+
+# touchdown criteria: ground contact is a landing (not a crash) if the sink
+# rate is gentle, the wings are close to level and the attitude is sane
+TD_SINK_MAX = 3.0                   # m/s (a firm but safe touchdown)
+TD_BANK_MAX = math.radians(5)       # wingtip / engine pod strike beyond this
+TD_PITCH_MIN = math.radians(-3)     # nosewheel-first impact
+TD_PITCH_MAX = math.radians(12)     # tail strike
 
 _ZERO3 = np.zeros(3)
 
@@ -166,10 +191,12 @@ def q_from_euler(roll, pitch, yaw):
 
 def simulate(K_h, K_vs, phase='takeoff', fail_engines=(), fail_time=None,
              accident=None, accident_side='left', mass_kg=None, wind=(0.0, 0.0, 0.0),
-             record=False, metrics=False):
+             turb_sigma=0.0, seed=0, record=False, metrics=False):
     P = PHASES[phase]
     config = P['config']
     m = mass_kg if mass_kg else mass          # swept weight (defaults to nominal)
+    inertia_scale = m / mass                  # inertia tracks the swept weight
+    Ixx_s, Iyy_s, Izz_s = Ixx * inertia_scale, Iyy * inertia_scale, Izz * inertia_scale
     steady_wind = np.array(wind, dtype=float)  # constant NED wind (m/s)
     cfg = CONFIGS[config]
     CL0, CD0 = cfg['CL0'], cfg['CD0']
@@ -178,11 +205,27 @@ def simulate(K_h, K_vs, phase='takeoff', fail_engines=(), fail_time=None,
     vs_max = P['vs_max']
     fset = set(fail_engines)
 
-    # initial state: wings level, small nose-up trim, heading north
-    q = q_from_euler(0.0, math.radians(4 if phase != 'cruise' else 2), 0.0)
-    Vb = np.array([P['V0'], 0.0, 0.0])     # body velocity (u fwd, v right, w down)
+    # initial state: wings level, small nose-up trim, heading north, in trimmed
+    # flight (level flight path, so AoA equals the pitch attitude)
+    pitch0 = math.radians(4 if phase != 'cruise' else 2)
+    q = q_from_euler(0.0, pitch0, 0.0)
+    Vb = rot_n2b(q, np.array([P['V0'], 0.0, 0.0]))   # body velocity (u fwd, v right, w down)
     omega = np.array([0.0, 0.0, 0.0])      # body rates (p roll, q pitch, r yaw)
     posn = np.array([0.0, 0.0, -P['y0']])  # world NED position (z down)
+
+    # engines start at an estimated level-flight trim thrust
+    rho_i = air_density(P['y0'])
+    Q_i = 0.5 * rho_i * P['V0'] ** 2
+    CL_i = m * g / (Q_i * wing_area)
+    T_trim = Q_i * wing_area * (CD0 + k_induced * CL_i * CL_i) / n_engines
+    eng_thrust = np.full(n_engines, max(idle_fraction * thrust_per_engine,
+                                        min(thrust_per_engine, T_trim)))
+    # actual surface positions (rate-limited); elevator starts at pitch trim
+    elev_pos = max(-elev_max, min(elev_max, -Cm_alpha * pitch0 / Cm_de))
+    ail_pos = rud_pos = 0.0
+    gust = np.zeros(3)
+    rng = np.random.default_rng(seed) if turb_sigma > 0 else None
+    V_prev = P['V0']
 
     spd_integral = 0.0
     vs_integral = 0.0
@@ -200,6 +243,7 @@ def simulate(K_h, K_vs, phase='takeoff', fail_engines=(), fail_time=None,
     max_bank = 0.0
     max_aoa = 0.0
     crashed = False
+    landed = False
 
     t = 0.0
     while t < P['dur']:
@@ -210,6 +254,11 @@ def simulate(K_h, K_vs, phase='takeoff', fail_engines=(), fail_time=None,
         wind_ned = steady_wind
         if accident == 'windshear' and fail_time is not None and t >= fail_time:
             wind_ned = steady_wind + microburst_wind(t - fail_time)
+        if rng is not None:
+            a = np.exp(-dt * max(V_prev, 30.0) / TURB_L)   # Gauss-Markov per axis
+            sig = turb_sigma * np.array([1.0, 1.0, TURB_W_FRAC])
+            gust = a * gust + sig * np.sqrt(1.0 - a * a) * rng.standard_normal(3)
+            wind_ned = wind_ned + gust
         wb = rot_n2b(q, wind_ned) if (wind_ned != 0).any() else _ZERO3
         ua, va, wa = u - wb[0], v - wb[1], w - wb[2]
         V = max(math.sqrt(ua*ua + va*va + wa*wa), 1e-3)   # airspeed
@@ -218,20 +267,25 @@ def simulate(K_h, K_vs, phase='takeoff', fail_engines=(), fail_time=None,
         Q = 0.5 * rho * V * V
         roll, pitch, yaw = euler_from_q(q)
 
-        # engines + autothrottle
+        # engines + autothrottle. Working engines spool toward their share of the
+        # autothrottle command with a first-order lag; dead engines run down to
+        # windmilling drag, which also yaws the aircraft toward the dead side.
         failed = fail_time is not None and t >= fail_time and fset
-        working = [i for i in range(n_engines) if not (failed and (i + 1) in fset)]
-        n_ok = len(working)
+        ok = np.array([not (failed and (i + 1) in fset) for i in range(n_engines)])
+        n_ok = int(ok.sum())
         avail_max = thrust_per_engine * n_ok
         avail_idle = idle_fraction * thrust_per_engine * n_ok
         spd_error = V_target - V
         spd_integral = spd_integral + spd_error * dt
         thrust_cmd = Kp_spd * spd_error + Ki_spd * spd_integral
-        thrust_total = max(avail_idle, min(avail_max, thrust_cmd))
-        if thrust_total != thrust_cmd:
+        total_cmd = max(avail_idle, min(avail_max, thrust_cmd))
+        if total_cmd != thrust_cmd:
             spd_integral = spd_integral - spd_error * dt
-        per_engine = thrust_total / n_ok if n_ok else 0.0
-        yaw_thrust = sum(-per_engine * engine_y[i] for i in working)   # moment about body z
+        eng_cmd = np.where(ok, total_cmd / n_ok if n_ok else 0.0, -windmill_drag)
+        tau = np.where(eng_cmd > eng_thrust, tau_spool_up, tau_spool_dn)
+        eng_thrust = eng_thrust + (eng_cmd - eng_thrust) * (dt / tau)
+        thrust_total = float(eng_thrust.sum())
+        yaw_thrust = float(-(eng_thrust * engine_y).sum())   # moment about body z
 
         # guidance: altitude -> climb rate -> pitch command
         climb = -rot_b2n(q, Vb)[2]
@@ -244,25 +298,26 @@ def simulate(K_h, K_vs, phase='takeoff', fail_engines=(), fail_time=None,
             vs_integral = vs_integral + vs_e * dt
 
         # control laws (elevator pitch-hold, aileron heading/bank-hold, rudder sideslip+yaw damper)
-        elevator = max(-elev_max, min(elev_max, Ke_p * (pitch - pitch_cmd) + Ke_d * omega[1]))
+        elev_cmd = max(-elev_max, min(elev_max, Ke_p * (pitch - pitch_cmd) + Ke_d * omega[1]))
         roll_cmd = max(-bank_max, min(bank_max, Kpsi * (0.0 - yaw)))
-        aileron = max(-ail_max, min(ail_max, Ka_p * (roll_cmd - roll) - Ka_d * omega[0]))
-        rudder = max(-rud_max, min(rud_max, -Kr_b * beta + Kr_d * omega[2]))
+        ail_cmd = max(-ail_max, min(ail_max, Ka_p * (roll_cmd - roll) - Ka_d * omega[0]))
+        rud_cmd = max(-rud_max, min(rud_max, -Kr_b * beta + Kr_d * omega[2]))
 
-        # accident effects (jam controls, add disturbance moments / lift loss)
+        # accident effects (override surface commands, add disturbance moments / lift loss)
         acc_on = accident is not None and fail_time is not None and t >= fail_time
         sgn = -1.0 if accident_side == 'left' else 1.0
         Cl_extra = Cm_extra = Cn_extra = 0.0
         lift_factor = 1.0
+        ctrl_factor = 1.0
         if acc_on:
             if accident == 'rudder-hardover':
-                rudder = sgn * rud_max
+                rud_cmd = sgn * rud_max            # slews to the stop at actuator rate
             elif accident == 'aileron-hardover':
-                aileron = sgn * ail_max
+                ail_cmd = sgn * ail_max
             elif accident == 'elevator-jam':
                 if jam_elev is None:
-                    jam_elev = elevator           # freeze at the value when it jammed
-                elevator = jam_elev
+                    jam_elev = elev_pos            # freeze where the surface physically is
+                elev_cmd = jam_elev
             elif accident == 'runaway-trim':
                 Cm_extra = -min(RUNAWAY_TRIM_MAX, RUNAWAY_TRIM_RATE * (t - fail_time))
             elif accident == 'wing-loss':
@@ -274,9 +329,15 @@ def simulate(K_h, K_vs, phase='takeoff', fail_engines=(), fail_time=None,
                 if not exploded:
                     omega = omega + sgn * np.array(EXPLOSION_SPIN)   # impulsive tumble
                     exploded = True
-                elevator *= EXPLOSION_CTRL
-                aileron *= EXPLOSION_CTRL
-                rudder *= EXPLOSION_CTRL
+                ctrl_factor = EXPLOSION_CTRL
+
+        # actuators slew toward their commands at the rate limits
+        elev_pos = slew(elev_pos, elev_cmd, elev_rate)
+        ail_pos = slew(ail_pos, ail_cmd, ail_rate)
+        rud_pos = slew(rud_pos, rud_cmd, rud_rate)
+        elevator = elev_pos * ctrl_factor          # aerodynamic effectiveness
+        aileron = ail_pos * ctrl_factor
+        rudder = rud_pos * ctrl_factor
 
         # aerodynamic coefficients (full-envelope longitudinal, linear lateral)
         sep = max(0.0, min(1.0, (abs(alpha) - alpha_stall) / math.radians(8)))
@@ -312,9 +373,9 @@ def simulate(K_h, K_vs, phase='takeoff', fail_engines=(), fail_time=None,
         Nm = Q * wing_area * span * Cn + yaw_thrust
 
         p, qrate, r = omega
-        pdot = (Lm + (Iyy - Izz) * qrate * r) / Ixx
-        qdot = (Mm + (Izz - Ixx) * p * r) / Iyy
-        rdot = (Nm + (Ixx - Iyy) * p * qrate) / Izz
+        pdot = (Lm + (Iyy_s - Izz_s) * qrate * r) / Ixx_s
+        qdot = (Mm + (Izz_s - Ixx_s) * p * r) / Iyy_s
+        rdot = (Nm + (Ixx_s - Iyy_s) * p * qrate) / Izz_s
         udot = Fx / m - (qrate * w - r * v)
         vdot = Fy / m - (r * u - p * w)
         wdot = Fz / m - (p * v - qrate * u)
@@ -342,31 +403,40 @@ def simulate(K_h, K_vs, phase='takeoff', fail_engines=(), fail_time=None,
         if airborne:
             min_alt = min(min_alt, h)
 
+        V_prev = V
         t += dt
         if record:
             history.append((t, posn[0], -posn[2], posn[1],
                             math.degrees(roll), math.degrees(pitch), math.degrees(yaw),
                             math.degrees(alpha), math.degrees(beta), V,
-                            stall_speed(h, config, m)))
+                            stall_speed(h, config, m),
+                            math.degrees(elevator), math.degrees(aileron),
+                            math.degrees(rudder), thrust_total / 1000.0))
         if h > P['y0'] + 20 or P['y0'] > 50:
             airborne = True
         if airborne and h <= 0:
-            crashed = True
+            landed = bool(climb > -TD_SINK_MAX and abs(roll) < TD_BANK_MAX
+                          and TD_PITCH_MIN < pitch < TD_PITCH_MAX)
+            crashed = not landed
             break
 
     score = total_error + 30.0 * overshoot + 40.0 * fast_climb + 20.0 * effort
     if metrics:
-        return dict(crashed=crashed, t_end=round(t, 1), duration=P['dur'],
-                    peak_alt=round(peak_alt), min_alt=round(min(min_alt, peak_alt)),
-                    min_speed=round(min_speed), min_margin=round(min_margin),
-                    max_bank=round(max_bank), max_aoa=round(max_aoa, 1))
+        result = dict(crashed=crashed, landed=landed, t_end=round(t, 1), duration=P['dur'],
+                      peak_alt=round(peak_alt), min_alt=round(min(min_alt, peak_alt)),
+                      min_speed=round(min_speed), min_margin=round(min_margin),
+                      max_bank=round(max_bank), max_aoa=round(max_aoa, 1))
+        return (result, history) if record else result
     if record:
         return score, history
     return score
 
-def write_flight(filename, history):
-    cols = ['t', 'x', 'y', 'y_lat', 'roll', 'pitch', 'yaw', 'alpha', 'beta', 'airspeed', 'stall_speed']
+def write_flight(filename, history, fail_time=None):
+    cols = ['t', 'x', 'y', 'y_lat', 'roll', 'pitch', 'yaw', 'alpha', 'beta', 'airspeed',
+            'stall_speed', 'elevator', 'aileron', 'rudder', 'thrust_kN']
     with open(filename, 'w') as f:
+        if fail_time is not None:
+            f.write(f'# fail_time={fail_time}\n')
         f.write(','.join(cols) + '\n')
         for row in history:
             f.write(','.join(str(v) for v in row) + '\n')
@@ -396,6 +466,9 @@ if __name__ == '__main__':
     ap.add_argument('--side', choices=['left', 'right'], default='left',
                     help='affected side / hardover direction for asymmetric accidents (default: left)')
     ap.add_argument('--fail-time', type=float, default=None, help='seconds into the run when the failure occurs')
+    ap.add_argument('--turbulence', type=float, default=0.0, metavar='SIGMA',
+                    help='RMS gust intensity in m/s (0 = calm; ~1.5 light, ~3 moderate, ~6 severe)')
+    ap.add_argument('--seed', type=int, default=0, help='turbulence random seed (default: 0)')
     ap.add_argument('--out', default='flight.csv', help='output flight file (default: flight.csv)')
     ap.add_argument('--search', action='store_true', help='run the takeoff gain search first')
     args = ap.parse_args()
@@ -411,17 +484,15 @@ if __name__ == '__main__':
     if (fail_engines or accident) and fail_time is None:
         fail_time = {'takeoff': 12.0, 'climb': 20.0, 'cruise': 30.0, 'approach': 30.0}[args.phase]
 
-    score, history = simulate(K_h, K_vs, phase=args.phase,
-                              fail_engines=fail_engines, fail_time=fail_time,
-                              accident=accident, accident_side=args.side, record=True)
-    write_flight(args.out, history)
+    res, history = simulate(K_h, K_vs, phase=args.phase,
+                            fail_engines=fail_engines, fail_time=fail_time,
+                            accident=accident, accident_side=args.side,
+                            turb_sigma=args.turbulence, seed=args.seed,
+                            record=True, metrics=True)
+    write_flight(args.out, history, fail_time=fail_time)
 
     P = PHASES[args.phase]
     last = history[-1]
-    peak = max(r[2] for r in history)
-    min_V = min(r[9] for r in history)
-    max_bank = max(abs(r[4]) for r in history)
-    crashed = last[2] <= 1 and last[0] < P['dur'] - 0.5
     print(f"phase={args.phase}  config={P['config']}")
     if fail_engines:
         side = 'left' if all(e <= 2 for e in fail_engines) else ('right' if all(e >= 3 for e in fail_engines) else 'both sides')
@@ -431,7 +502,15 @@ if __name__ == '__main__':
         print(f"accident: {accident} ({args.side}) at t={fail_time:.0f}s")
     if not fail_engines and not accident:
         print('all systems nominal')
-    print(f"peak altitude {peak:.0f} m, min airspeed {min_V:.0f} m/s, max bank {max_bank:.0f} deg, "
-          f"final heading {last[6]:.0f} deg")
-    print("OUTCOME: " + (f"ground impact at t={last[0]:.1f}s" if crashed else "still flying at end of window"))
+    if args.turbulence > 0:
+        print(f'turbulence: sigma={args.turbulence} m/s (seed {args.seed})')
+    print(f"peak altitude {res['peak_alt']} m, min airspeed {res['min_speed']} m/s, "
+          f"max bank {res['max_bank']} deg, final heading {last[6]:.0f} deg")
+    if res['crashed']:
+        outcome = f"ground impact at t={res['t_end']}s"
+    elif res['landed']:
+        outcome = f"touched down safely at t={res['t_end']}s"
+    else:
+        outcome = "still flying at end of window"
+    print("OUTCOME: " + outcome)
     print(f"wrote {args.out}  (view with: python visualiser.py {args.out})")
